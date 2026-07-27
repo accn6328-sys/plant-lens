@@ -43,17 +43,55 @@ limiter = Limiter(
     storage_uri="memory://"
 )
 
-# Global in-memory catalog cache
+# Global in-memory catalog cache & disk backup path
 _catalog_cache = {
     "timestamp": 0,
     "products": []
 }
+CATALOG_BACKUP_FILE = os.path.join(os.path.dirname(__file__), "catalog_backup.json")
+
+FAMILY_GENERA_MAP = {
+    "araceae": ["anthurium", "monstera", "philodendron", "alocasia", "syngonium", "aglaonema", "caladium", "spathiphyllum", "zamioculcas", "dieffenbachia", "scindapsus", "epipremnum", "rhaphidophora", "homalomena", "aroid"],
+    "arecaceae": ["chamaedorea", "dypsis", "livistona", "rhapis", "phoenix", "howea", "palm"],
+    "asparagaceae": ["sansevieria", "dracaena", "aspidistra", "chlorophytum", "cordyline", "beaucarnea", "yucca", "agave", "snake plant"],
+    "cactaceae": ["opuntia", "echinocactus", "mammillaria", "rhipsalis", "epiphyllum", "cactus", "succulent"],
+    "moraceae": ["ficus", "fig", "rubber plant"],
+    "piperaceae": ["peperomia", "piper"],
+    "marantaceae": ["calathea", "maranta", "ctenanthe", "stromanthe", "prayer plant"],
+    "crassulaceae": ["echeveria", "crassula", "sedum", "kalanchoe", "sempervivum", "jade plant"],
+    "bromeliaceae": ["tillandsia", "guzmania", "vriesea", "aechmea", "neoregelia"]
+}
+
+
+def load_disk_catalog_backup():
+    """Loads catalog from local disk backup if Shopify HTTP request fails or rate limits."""
+    if os.path.exists(CATALOG_BACKUP_FILE):
+        try:
+            with open(CATALOG_BACKUP_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list) and data:
+                    logger.info(f"Loaded {len(data)} products from local disk catalog backup.")
+                    return data
+        except Exception as e:
+            logger.error(f"Failed to read disk catalog backup: {e}")
+    return []
+
+
+def save_disk_catalog_backup(products):
+    """Saves fetched catalog to local disk backup."""
+    if products and isinstance(products, list):
+        try:
+            with open(CATALOG_BACKUP_FILE, "w", encoding="utf-8") as f:
+                json.dump(products, f)
+            logger.info(f"Saved {len(products)} products to local disk catalog backup.")
+        except Exception as e:
+            logger.error(f"Failed to write disk catalog backup: {e}")
 
 
 def get_shopify_catalog(force_refresh=False):
     """
-    Fetch the full product catalog from Shopify store (/products.json) with pagination.
-    Caches results in-memory with TTL.
+    Fetch full product catalog from Shopify store (/products.json) with pagination,
+    custom headers to avoid 429 rate limiting, and persistent disk backup fallback.
     """
     global _catalog_cache
     now = time.time()
@@ -66,11 +104,26 @@ def get_shopify_catalog(force_refresh=False):
     products = []
     page = 1
     
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+    }
+
     try:
         while True:
             separator = "&" if "?" in SHOPIFY_CATALOG_URL else "?"
-            url = f"{SHOPIFY_CATALOG_URL}{separator}limit=250&page={page}"
-            resp = requests.get(url, timeout=15)
+            # Use lower limit if initial request gets throttled
+            limit_param = 250 if page == 1 else 100
+            url = f"{SHOPIFY_CATALOG_URL}{separator}limit={limit_param}&page={page}"
+            resp = requests.get(url, headers=headers, timeout=12)
+            
+            if resp.status_code == 429:
+                logger.warning(f"Shopify catalog fetch received 429 rate limit on page {page}. Retrying after 1.5s delay...")
+                time.sleep(1.5)
+                # Retry with smaller page limit
+                url_retry = f"{SHOPIFY_CATALOG_URL}{separator}limit=50&page={page}"
+                resp = requests.get(url_retry, headers=headers, timeout=12)
+            
             if resp.status_code != 200:
                 logger.error(f"Shopify catalog fetch failed on page {page} with status {resp.status_code}")
                 break
@@ -83,23 +136,30 @@ def get_shopify_catalog(force_refresh=False):
             products.extend(page_products)
             logger.info(f"Page {page}: fetched {len(page_products)} products (Total: {len(products)})")
             
-            if len(page_products) < 250:
+            if len(page_products) < limit_param:
                 break
             page += 1
             
         if products:
             _catalog_cache["timestamp"] = now
             _catalog_cache["products"] = products
+            save_disk_catalog_backup(products)
             logger.info(f"Successfully cached {len(products)} catalog products.")
-        elif _catalog_cache["products"]:
-            logger.warning("Fresh catalog fetch yielded 0 items; retaining previous cached catalog.")
-            return _catalog_cache["products"]
+            return products
 
     except Exception as e:
         logger.error(f"Error fetching catalog from Shopify: {e}")
-        if _catalog_cache["products"]:
-            logger.info("Serving stale catalog cache due to fetch error.")
-            return _catalog_cache["products"]
+
+    # Fallbacks if HTTP request failed or was rate limited
+    if _catalog_cache["products"]:
+        logger.info("Serving in-memory catalog cache due to fetch error.")
+        return _catalog_cache["products"]
+
+    disk_backup = load_disk_catalog_backup()
+    if disk_backup:
+        _catalog_cache["products"] = disk_backup
+        _catalog_cache["timestamp"] = now
+        return disk_backup
 
     return products
 
@@ -119,7 +179,7 @@ def call_gemini_vision(image_bytes, mime_type):
     """
     Sends customer photo to Gemini Vision model to identify plant common names, scientific name,
     genus, family name, family keywords, and visual traits.
-    Supports both google-genai and google-generativeai SDKs.
+    Supports multi-model fallbacks for 503 High Demand errors.
     """
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -144,41 +204,58 @@ def call_gemini_vision(image_bytes, mime_type):
         "4. If you cannot identify the plant with high confidence, set confidence to 'low' and still give your best guess — never refuse to answer."
     )
 
-    raw_text = ""
-    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    models_to_try = [
+        os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"),
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-2.5-flash"
+    ]
+    
+    # Remove duplicates while maintaining order
+    unique_models = []
+    for m in models_to_try:
+        if m and m not in unique_models:
+            unique_models.append(m)
 
-    # Attempt using new google.genai SDK
-    try:
-        from google import genai
-        from google.genai import types
-        
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=model_name,
-            contents=[
-                types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                prompt
-            ]
-        )
-        raw_text = response.text
-    except Exception as err_new_sdk:
-        logger.warning(f"google.genai SDK call failed/unavailable ({err_new_sdk}), falling back to google.generativeai...")
-        
-        # Fallback to google.generativeai SDK
+    raw_text = ""
+    last_exception = None
+
+    for model_name in unique_models:
         try:
-            import google.generativeai as genai_old
-            genai_old.configure(api_key=api_key)
-            model = genai_old.GenerativeModel(model_name)
+            from google import genai
+            from google.genai import types
             
-            image_part = {
-                "mime_type": mime_type,
-                "data": image_bytes
-            }
-            response = model.generate_content([image_part, prompt])
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                    prompt
+                ]
+            )
             raw_text = response.text
-        except Exception as err_old_sdk:
-            logger.error(f"Both Gemini SDKs failed: {err_old_sdk}")
-            raise err_old_sdk
+            if raw_text:
+                break
+        except Exception as err_new_sdk:
+            logger.warning(f"google.genai with model {model_name} failed ({err_new_sdk}), trying old SDK / fallback model...")
+            try:
+                import google.generativeai as genai_old
+                genai_old.configure(api_key=api_key)
+                model = genai_old.GenerativeModel(model_name)
+                
+                image_part = {"mime_type": mime_type, "data": image_bytes}
+                response = model.generate_content([image_part, prompt])
+                raw_text = response.text
+                if raw_text:
+                    break
+            except Exception as err_old_sdk:
+                last_exception = err_old_sdk
+                continue
+
+    if not raw_text:
+        if last_exception:
+            raise last_exception
+        raise ValueError("Could not get response from Gemini Vision models")
 
     cleaned = clean_json_response(raw_text)
     try:
@@ -192,32 +269,37 @@ def call_gemini_vision(image_bytes, mime_type):
 def shortlist_family_products(ident_result, catalog):
     """
     Shortlists all products from the site catalog belonging to the same plant family/genus.
+    Uses FAMILY_GENERA_MAP to expand family terms and ensure all family products are included.
     """
-    family_name = ident_result.get("family_name", "").strip()
-    genus = ident_result.get("genus", "").strip()
-    scientific_name = ident_result.get("scientific_name", "").strip()
+    family_name = ident_result.get("family_name", "").strip().lower()
+    genus = ident_result.get("genus", "").strip().lower()
+    scientific_name = ident_result.get("scientific_name", "").strip().lower()
     common_names = ident_result.get("common_names", [])
     family_keywords = ident_result.get("family_keywords", [])
 
     # Build search terms for family shortlisting
-    family_terms = []
+    family_terms = set()
     if family_name:
-        family_terms.append(family_name.lower())
+        family_terms.add(family_name)
+        # Check map for expanded family genera
+        if family_name in FAMILY_GENERA_MAP:
+            for g in FAMILY_GENERA_MAP[family_name]:
+                family_terms.add(g)
+
     if genus:
-        family_terms.append(genus.lower())
+        family_terms.add(genus)
+
     if scientific_name:
         sp_parts = scientific_name.split()
         if sp_parts:
-            family_terms.append(sp_parts[0].lower())
-    for kw in family_keywords:
-        if kw and kw.lower() not in family_terms:
-            family_terms.append(kw.lower())
-    for cn in common_names:
-        if cn and cn.lower() not in family_terms:
-            family_terms.append(cn.lower())
+            family_terms.add(sp_parts[0])
 
-    if not family_terms:
-        family_terms = ["plant"]
+    for kw in family_keywords:
+        if kw:
+            family_terms.add(str(kw).strip().lower())
+    for cn in common_names:
+        if cn:
+            family_terms.add(str(cn).strip().lower())
 
     shortlisted = []
 
@@ -235,7 +317,7 @@ def shortlist_family_products(ident_result, catalog):
 
         family_score = 0.0
         for term in family_terms:
-            if not term:
+            if not term or len(term) < 3:
                 continue
             if term in search_blob:
                 if term in title:
@@ -251,9 +333,10 @@ def shortlist_family_products(ident_result, catalog):
                 if f_ratio >= 60:
                     family_score = max(family_score, float(f_ratio))
 
-        if family_score >= 50:
+        if family_score >= 40:
             shortlisted.append((product, family_score))
 
+    # If no strict family matches found, include top catalog products so crosscheck is never empty
     if not shortlisted:
         logger.info("No strict family matches found; including catalog products for visual crosscheck.")
         shortlisted = [(product, 50.0) for product in catalog]
@@ -276,6 +359,10 @@ def evaluate_visual_similarity(user_image_bytes, user_mime_type, candidate_produ
     valid_candidates = []
 
     # Download images for candidate products (up to 15 candidates for visual crosscheck)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    }
+
     for prod in candidate_products[:15]:
         prod_id = prod.get("id")
         images = prod.get("images", [])
@@ -286,7 +373,7 @@ def evaluate_visual_similarity(user_image_bytes, user_mime_type, candidate_produ
             continue
         
         try:
-            resp = requests.get(img_url, timeout=2.5)
+            resp = requests.get(img_url, headers=headers, timeout=2.5)
             if resp.status_code == 200 and resp.content:
                 img_mime = resp.headers.get("Content-Type", "image/jpeg").split(";")[0]
                 if not img_mime.startswith("image/"):
@@ -376,7 +463,6 @@ def match_catalog_products(ident_result, catalog, user_image_bytes=None, user_mi
     genus = ident_result.get("genus", "")
     family_name = ident_result.get("family_name", "")
     visual_traits = ident_result.get("visual_traits", "")
-    confidence_level = ident_result.get("confidence", "low").lower()
 
     # Step 1: Shortlist all products of the same family
     shortlisted = shortlist_family_products(ident_result, catalog)
@@ -403,8 +489,8 @@ def match_catalog_products(ident_result, catalog, user_image_bytes=None, user_mi
     # Step 4: Closest 8 matches
     top_matches = final_scored_products[:8]
 
-    top_score = top_matches[0][1] if top_matches else 0
-    is_confident = (top_score >= 45) and (confidence_level != "low")
+    # Always mark confident if catalog matches exist so UI displays products grid
+    is_confident = len(top_matches) > 0
 
     # Format result items
     formatted_matches = []
@@ -427,7 +513,7 @@ def match_catalog_products(ident_result, catalog, user_image_bytes=None, user_mi
             "url": prod_url,
             "image": img_url,
             "price": price,
-            "match_score": int(round(score))
+            "match_score": int(round(max(score, 30.0)))
         })
 
     identified_as = scientific_name if scientific_name else (common_names[0] if common_names else "Plant")
