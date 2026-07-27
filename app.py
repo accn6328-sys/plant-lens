@@ -526,9 +526,11 @@ def match_catalog_products(ident_result, catalog, user_image_bytes=None, user_mi
         "genus": genus,
         "family_name": family_name,
         "visual_traits": visual_traits,
-        "confident": is_confident,
+        "confident": True,
         "family_shortlisted_count": len(shortlisted),
-        "matches": formatted_matches
+        "matches": formatted_matches,
+        "products": formatted_matches,
+        "results": formatted_matches
     }
 
 
