@@ -43,24 +43,7 @@ limiter = Limiter(
     storage_uri="memory://"
 )
 
-# Global in-memory catalog cache & disk backup path
-_catalog_cache = {
-    "timestamp": 0,
-    "products": []
-}
 CATALOG_BACKUP_FILE = os.path.join(os.path.dirname(__file__), "catalog_backup.json")
-
-FAMILY_GENERA_MAP = {
-    "araceae": ["anthurium", "monstera", "philodendron", "alocasia", "syngonium", "aglaonema", "caladium", "spathiphyllum", "zamioculcas", "dieffenbachia", "scindapsus", "epipremnum", "rhaphidophora", "homalomena", "aroid"],
-    "arecaceae": ["chamaedorea", "dypsis", "livistona", "rhapis", "phoenix", "howea", "palm"],
-    "asparagaceae": ["sansevieria", "dracaena", "aspidistra", "chlorophytum", "cordyline", "beaucarnea", "yucca", "agave", "snake plant"],
-    "cactaceae": ["opuntia", "echinocactus", "mammillaria", "rhipsalis", "epiphyllum", "cactus", "succulent"],
-    "moraceae": ["ficus", "fig", "rubber plant"],
-    "piperaceae": ["peperomia", "piper"],
-    "marantaceae": ["calathea", "maranta", "ctenanthe", "stromanthe", "prayer plant"],
-    "crassulaceae": ["echeveria", "crassula", "sedum", "kalanchoe", "sempervivum", "jade plant"],
-    "bromeliaceae": ["tillandsia", "guzmania", "vriesea", "aechmea", "neoregelia"]
-}
 
 
 def load_disk_catalog_backup():
@@ -75,6 +58,26 @@ def load_disk_catalog_backup():
         except Exception as e:
             logger.error(f"Failed to read disk catalog backup: {e}")
     return []
+
+
+# Global in-memory catalog cache pre-loaded with bundled catalog backup
+_initial_products = load_disk_catalog_backup()
+_catalog_cache = {
+    "timestamp": time.time() if _initial_products else 0,
+    "products": _initial_products
+}
+
+FAMILY_GENERA_MAP = {
+    "araceae": ["anthurium", "monstera", "philodendron", "alocasia", "syngonium", "aglaonema", "caladium", "spathiphyllum", "zamioculcas", "dieffenbachia", "scindapsus", "epipremnum", "rhaphidophora", "homalomena", "aroid"],
+    "arecaceae": ["chamaedorea", "dypsis", "livistona", "rhapis", "phoenix", "howea", "palm"],
+    "asparagaceae": ["sansevieria", "dracaena", "aspidistra", "chlorophytum", "cordyline", "beaucarnea", "yucca", "agave", "snake plant"],
+    "cactaceae": ["opuntia", "echinocactus", "mammillaria", "rhipsalis", "epiphyllum", "cactus", "succulent"],
+    "moraceae": ["ficus", "fig", "rubber plant"],
+    "piperaceae": ["peperomia", "piper"],
+    "marantaceae": ["calathea", "maranta", "ctenanthe", "stromanthe", "prayer plant"],
+    "crassulaceae": ["echeveria", "crassula", "sedum", "kalanchoe", "sempervivum", "jade plant"],
+    "bromeliaceae": ["tillandsia", "guzmania", "vriesea", "aechmea", "neoregelia"]
+}
 
 
 def save_disk_catalog_backup(products):
