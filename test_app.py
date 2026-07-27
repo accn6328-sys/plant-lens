@@ -88,15 +88,14 @@ class PlantLensApiTestCase(unittest.TestCase):
         self.assertIn('valid image', res_data.get('error', ''))
 
     def test_catalog_matching_high_confidence(self):
-        """Test catalog rapidfuzz matching with exact/high species match."""
+        """Test catalog family matching with exact/high species match."""
         ident = {
             "common_names": ["Swiss Cheese Plant", "Monstera"],
             "scientific_name": "Monstera deliciosa",
+            "genus": "Monstera",
             "family_name": "Araceae",
-            "confidence": "high",
-            "related_species": [
-                {"species": "Monstera adansonii", "relationship_features": "Closely related species with smaller perforated leaves"}
-            ]
+            "family_keywords": ["Monstera", "Araceae"],
+            "confidence": "high"
         }
         result = match_catalog_products(ident, _catalog_cache['products'])
         self.assertEqual(result['identified_as'], "Monstera deliciosa")
@@ -105,21 +104,23 @@ class PlantLensApiTestCase(unittest.TestCase):
         self.assertEqual(result['matches'][0]['id'], 101)
         self.assertEqual(result['matches'][0]['title'], "Monstera Deliciosa - Swiss Cheese Plant")
 
-    def test_catalog_matching_related_species_limit(self):
-        """Test that related_species is capped at 12 items and matches capped at 8."""
+    def test_family_shortlisting_and_visual_matches(self):
+        """Test that site products are shortlisted by family name and matches capped at 8."""
         ident = {
             "common_names": ["Crystal Anthurium"],
             "scientific_name": "Anthurium crystallinum",
+            "genus": "Anthurium",
             "family_name": "Araceae",
-            "confidence": "high",
-            "related_species": [{"species": f"Anthurium species {i}", "relationship_features": "Velvet leaf species"} for i in range(15)]
+            "family_keywords": ["Anthurium", "Araceae"],
+            "confidence": "high"
         }
         result = match_catalog_products(ident, _catalog_cache['products'])
-        self.assertEqual(len(result['related_species']), 12)
+        self.assertEqual(result['family_name'], "Araceae")
+        self.assertGreaterEqual(result['family_shortlisted_count'], 1)
         self.assertLessEqual(len(result['matches']), 8)
 
     def test_catalog_matching_low_confidence_fallback(self):
-        """Test catalog rapidfuzz matching with unknown/unmatched plant."""
+        """Test catalog matching with unknown/unmatched plant."""
         ident = {
             "common_names": ["Unusual Desert Moss"],
             "scientific_name": "Unknown species",

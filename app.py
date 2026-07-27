@@ -118,7 +118,7 @@ def clean_json_response(raw_text):
 def call_gemini_vision(image_bytes, mime_type):
     """
     Sends customer photo to Gemini Vision model to identify plant common names, scientific name,
-    family name, visual traits, and AT MOST 12 related species of the same family/genus.
+    genus, family name, family keywords, and visual traits.
     Supports both google-genai and google-generativeai SDKs.
     """
     api_key = os.getenv("GEMINI_API_KEY")
@@ -127,25 +127,21 @@ def call_gemini_vision(image_bytes, mime_type):
 
     prompt = (
         "You are identifying a houseplant from a customer photo for a plant store's visual search feature.\n"
-        "Look at the plant in this image and respond with ONLY valid JSON, no markdown fences, no preamble, in this exact JSON format:\n\n"
+        "Analyze the plant in this photo and respond with ONLY valid JSON, no markdown fences, no preamble, in this exact JSON format:\n\n"
         "{\n"
         '  "common_names": ["most likely common name", "alternate common name"],\n'
         '  "scientific_name": "Genus species",\n'
+        '  "genus": "Genus name (e.g. Anthurium)",\n'
         '  "family_name": "Family name (e.g. Araceae)",\n'
+        '  "family_keywords": ["Anthurium", "Araceae", "velvet cardboard leaf", "aroid"],\n'
         '  "confidence": "high" | "medium" | "low",\n'
-        '  "visual_traits": "one short sentence describing leaf shape, color pattern, growth habit",\n'
-        '  "related_species": [\n'
-        '    {\n'
-        '      "species": "Genus species2",\n'
-        '      "relationship_features": "Short description of relationship and notable features"\n'
-        '    }\n'
-        '  ]\n'
+        '  "visual_traits": "one short sentence describing leaf shape, color pattern, growth habit"\n'
         "}\n\n"
         "CRITICAL INSTRUCTIONS:\n"
         "1. List 1-3 common_names ordered by likelihood.\n"
-        "2. Include AT MOST 12 related species of the SAME family or genus as the identified plant (e.g., if identified as Anthurium crystallinum, list up to 12 related Anthurium species like Anthurium magnificum, Anthurium regale, Anthurium clarinervium, etc.).\n"
-        "3. For each related species, provide its scientific name in 'species' and visual/taxonomic relationship in 'relationship_features'.\n"
-        "4. If you cannot identify the plant with high confidence, set confidence to 'low' and still give your best guess and related species — never refuse to answer."
+        "2. Identify the scientific_name, genus, and family_name of the plant accurately.\n"
+        "3. In family_keywords, include family_name, genus, common family names, and related plant terms to find all site products belonging to the same plant family.\n"
+        "4. If you cannot identify the plant with high confidence, set confidence to 'low' and still give your best guess — never refuse to answer."
     )
 
     raw_text = ""
@@ -187,20 +183,89 @@ def call_gemini_vision(image_bytes, mime_type):
     cleaned = clean_json_response(raw_text)
     try:
         data = json.loads(cleaned)
-        if "related_species" in data and isinstance(data["related_species"], list):
-            data["related_species"] = data["related_species"][:12]
-        else:
-            data["related_species"] = []
         return data
     except json.JSONDecodeError as jde:
         logger.error(f"Failed to parse Gemini response as JSON: {cleaned}")
         raise ValueError(f"Invalid JSON returned by Gemini Vision: {jde}")
 
 
+def shortlist_family_products(ident_result, catalog):
+    """
+    Shortlists all products from the site catalog belonging to the same plant family/genus.
+    """
+    family_name = ident_result.get("family_name", "").strip()
+    genus = ident_result.get("genus", "").strip()
+    scientific_name = ident_result.get("scientific_name", "").strip()
+    common_names = ident_result.get("common_names", [])
+    family_keywords = ident_result.get("family_keywords", [])
+
+    # Build search terms for family shortlisting
+    family_terms = []
+    if family_name:
+        family_terms.append(family_name.lower())
+    if genus:
+        family_terms.append(genus.lower())
+    if scientific_name:
+        sp_parts = scientific_name.split()
+        if sp_parts:
+            family_terms.append(sp_parts[0].lower())
+    for kw in family_keywords:
+        if kw and kw.lower() not in family_terms:
+            family_terms.append(kw.lower())
+    for cn in common_names:
+        if cn and cn.lower() not in family_terms:
+            family_terms.append(cn.lower())
+
+    if not family_terms:
+        family_terms = ["plant"]
+
+    shortlisted = []
+
+    for product in catalog:
+        title = product.get("title", "").lower()
+        tags = product.get("tags", [])
+        if isinstance(tags, list):
+            tags_str = " ".join(tags).lower()
+        else:
+            tags_str = str(tags).lower()
+        product_type = product.get("product_type", "").lower()
+        handle = product.get("handle", "").lower()
+
+        search_blob = f"{title} {tags_str} {product_type} {handle}"
+
+        family_score = 0.0
+        for term in family_terms:
+            if not term:
+                continue
+            if term in search_blob:
+                if term in title:
+                    family_score = max(family_score, 100.0)
+                elif term in tags_str:
+                    family_score = max(family_score, 90.0)
+                else:
+                    family_score = max(family_score, 80.0)
+            else:
+                token_ratio = fuzz.token_set_ratio(term, search_blob)
+                partial_ratio = fuzz.partial_ratio(term, search_blob)
+                f_ratio = max(token_ratio, partial_ratio)
+                if f_ratio >= 60:
+                    family_score = max(family_score, float(f_ratio))
+
+        if family_score >= 50:
+            shortlisted.append((product, family_score))
+
+    if not shortlisted:
+        logger.info("No strict family matches found; including catalog products for visual crosscheck.")
+        shortlisted = [(product, 50.0) for product in catalog]
+
+    shortlisted.sort(key=lambda x: x[1], reverse=True)
+    return shortlisted
+
+
 def evaluate_visual_similarity(user_image_bytes, user_mime_type, candidate_products):
     """
-    Downloads candidate product images and calls Gemini Vision to score visual similarity (0-100)
-    between the user's uploaded plant image and candidate product images based on foliage visual traits.
+    Downloads candidate product images and calls Gemini Vision to crosscheck & score visual similarity (0-100)
+    between the user's uploaded plant photo and candidate product images.
     Returns dict mapping product_id -> visual_score (0-100).
     """
     api_key = os.getenv("GEMINI_API_KEY")
@@ -210,8 +275,8 @@ def evaluate_visual_similarity(user_image_bytes, user_mime_type, candidate_produ
     visual_scores = {}
     valid_candidates = []
 
-    # Download images for candidate products (up to 10 candidates for speed)
-    for prod in candidate_products[:10]:
+    # Download images for candidate products (up to 15 candidates for visual crosscheck)
+    for prod in candidate_products[:15]:
         prod_id = prod.get("id")
         images = prod.get("images", [])
         if not images:
@@ -241,8 +306,8 @@ def evaluate_visual_similarity(user_image_bytes, user_mime_type, candidate_produ
 
     prompt = (
         "Image 0 is a customer's uploaded plant photo. "
-        "The following images are candidate product photos from our catalog.\n"
-        "Compare each candidate product image against Image 0 and rate its visual similarity from 0 to 100 "
+        "The following images are candidate product photos of plants belonging to the same family from our store.\n"
+        "Crosscheck each candidate product image against Image 0 and rate its visual similarity from 0 to 100 "
         "based on leaf shape, pattern, venation, color, and visual foliage similarity.\n\n"
         "Respond ONLY with a valid JSON object mapping 1-based candidate index to score (0-100):\n"
         "{\n"
@@ -294,114 +359,52 @@ def evaluate_visual_similarity(user_image_bytes, user_mime_type, candidate_produ
 
         logger.info(f"Visual similarity evaluation completed for {len(visual_scores)} candidate products.")
     except Exception as e:
-        logger.warning(f"Visual similarity evaluation error: {e}. Using text matching scores.")
+        logger.warning(f"Visual similarity evaluation error: {e}. Using family matching scores.")
 
     return visual_scores
 
 
 def match_catalog_products(ident_result, catalog, user_image_bytes=None, user_mime_type="image/jpeg"):
     """
-    Fuzzy-matches identified plant & up to 12 related family species against product catalog text,
-    visually compares matching product images against user image, and returns closest 8 product matches.
+    Pipeline:
+    1. Shortlist all site products belonging to the same plant family/genus.
+    2. Visually crosscheck user image against shortlisted product images.
+    3. Return closest 8 matches with scores.
     """
     common_names = ident_result.get("common_names", [])
     scientific_name = ident_result.get("scientific_name", "")
+    genus = ident_result.get("genus", "")
     family_name = ident_result.get("family_name", "")
     visual_traits = ident_result.get("visual_traits", "")
     confidence_level = ident_result.get("confidence", "low").lower()
-    related_species = ident_result.get("related_species", [])
 
-    if not isinstance(related_species, list):
-        related_species = []
+    # Step 1: Shortlist all products of the same family
+    shortlisted = shortlist_family_products(ident_result, catalog)
+    candidate_products = [prod for prod, family_score in shortlisted]
 
-    # Clean related_species to ensure max 12 items
-    clean_related_species = []
-    for rel in related_species[:12]:
-        if isinstance(rel, dict):
-            sp_name = rel.get("species", rel.get("name", ""))
-            rel_feat = rel.get("relationship_features", rel.get("notable_features", rel.get("description", "")))
-            if sp_name:
-                clean_related_species.append({
-                    "species": sp_name,
-                    "relationship_features": rel_feat
-                })
-
-    candidates = []
-    if scientific_name:
-        candidates.append(scientific_name)
-    for name in common_names:
-        if name and name not in candidates:
-            candidates.append(name)
-    for rel in clean_related_species:
-        sp = rel.get("species", "")
-        if sp and sp not in candidates:
-            candidates.append(sp)
-
-    if not candidates:
-        candidates = ["plant"]
-
-    scored_products = []
-    
-    for product in catalog:
-        title = product.get("title", "")
-        tags = product.get("tags", [])
-        if isinstance(tags, list):
-            tags_str = " ".join(tags)
-        else:
-            tags_str = str(tags)
-        product_type = product.get("product_type", "")
-        
-        # Combine text fields into searchable string
-        search_blob = f"{title} {tags_str} {product_type}".lower()
-
-        best_candidate_score = 0.0
-        for candidate in candidates:
-            cand_lower = candidate.lower()
-            # Calculate match ratio using rapidfuzz token_set_ratio & partial_ratio
-            token_score = fuzz.token_set_ratio(cand_lower, search_blob)
-            partial_score = fuzz.partial_ratio(cand_lower, search_blob)
-            cand_score = max(token_score, partial_score)
-
-            # Bonus points if candidate word appears in title
-            if cand_lower in title.lower():
-                cand_score = min(100.0, cand_score + 15)
-
-            if cand_score > best_candidate_score:
-                best_candidate_score = cand_score
-
-        scored_products.append((product, best_candidate_score))
-
-    # Sort descending by match score
-    scored_products.sort(key=lambda x: x[1], reverse=True)
-    
-    # Filter candidate products for visual matching
-    candidate_products = [p for p, score in scored_products if score >= 30][:15]
-    if not candidate_products and scored_products:
-        candidate_products = [p for p, score in scored_products[:8]]
-
-    # Perform visual image similarity comparison if user image bytes provided
+    # Step 2: Crosscheck user given image with shortlisted product images
     visual_scores = {}
     if user_image_bytes and candidate_products:
         visual_scores = evaluate_visual_similarity(user_image_bytes, user_mime_type, candidate_products)
 
-    # Combine text score and visual similarity score
+    # Step 3: Combine scores (75% visual crosscheck, 25% family match relevance)
     final_scored_products = []
-    for product, text_score in scored_products:
-        prod_id = product.get("id")
+    for prod, family_score in shortlisted:
+        prod_id = prod.get("id")
         if prod_id in visual_scores:
             vis_score = visual_scores[prod_id]
-            combined_score = (0.7 * vis_score) + (0.3 * text_score)
+            combined_score = (0.75 * vis_score) + (0.25 * family_score)
         else:
-            combined_score = text_score
-        final_scored_products.append((product, combined_score))
+            combined_score = family_score
+        final_scored_products.append((prod, combined_score))
 
     final_scored_products.sort(key=lambda x: x[1], reverse=True)
-    
-    # Take top 8 closest matches
+
+    # Step 4: Closest 8 matches
     top_matches = final_scored_products[:8]
 
     top_score = top_matches[0][1] if top_matches else 0
-    is_confident = (top_score >= 50) and (confidence_level != "low")
+    is_confident = (top_score >= 45) and (confidence_level != "low")
 
     # Format result items
     formatted_matches = []
@@ -427,15 +430,15 @@ def match_catalog_products(ident_result, catalog, user_image_bytes=None, user_mi
             "match_score": int(round(score))
         })
 
-    # Pick best display name
     identified_as = scientific_name if scientific_name else (common_names[0] if common_names else "Plant")
 
     return {
         "identified_as": identified_as,
+        "genus": genus,
         "family_name": family_name,
         "visual_traits": visual_traits,
         "confident": is_confident,
-        "related_species": clean_related_species[:12],
+        "family_shortlisted_count": len(shortlisted),
         "matches": formatted_matches
     }
 
