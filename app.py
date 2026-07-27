@@ -50,7 +50,7 @@ def load_disk_catalog_backup():
     """Loads catalog from local disk backup if Shopify HTTP request fails or rate limits."""
     if os.path.exists(CATALOG_BACKUP_FILE):
         try:
-            with open(CATALOG_BACKUP_FILE, "r", encoding="utf-8") as f:
+            with open(CATALOG_BACKUP_FILE, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
                 if isinstance(data, list) and data:
                     logger.info(f"Loaded {len(data)} products from local disk catalog backup.")
